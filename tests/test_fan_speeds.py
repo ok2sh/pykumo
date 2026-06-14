@@ -62,8 +62,8 @@ class TestGetFanSpeeds(unittest.TestCase):
             speeds, ["superQuiet", "quiet", "low", "powerful", "superPowerful"]
         )
 
-    def test_set_fan_speed_accepts_superquiet_on_3speed(self):
-        """set_fan_speed must accept superQuiet for 3-speed units."""
+    def test_get_fan_speeds_includes_superquiet_on_3speed(self):
+        """get_fan_speeds() must include superQuiet for 3-speed units."""
         with patch.object(PyKumo, "__init__", lambda self, *a, **kw: None):
             unit = PyKumo.__new__(PyKumo)
         unit._profile = {"numberOfFanSpeeds": 3}
@@ -71,8 +71,8 @@ class TestGetFanSpeeds(unittest.TestCase):
         valid = unit.get_fan_speeds()
         self.assertIn("superQuiet", valid)
 
-    def test_set_fan_speed_accepts_superpowerful_on_3speed(self):
-        """set_fan_speed must accept superPowerful for 3-speed units."""
+    def test_get_fan_speeds_includes_superpowerful_on_3speed(self):
+        """get_fan_speeds() must include superPowerful for 3-speed units."""
         with patch.object(PyKumo, "__init__", lambda self, *a, **kw: None):
             unit = PyKumo.__new__(PyKumo)
         unit._profile = {"numberOfFanSpeeds": 3}
