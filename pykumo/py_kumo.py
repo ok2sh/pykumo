@@ -389,7 +389,11 @@ class PyKumo(PyKumoBase):
             )
 
         if speeds == 3:
-            valid_speeds = ["quiet", "low", "powerful"]
+            # Intentionally return all 5 speeds even though the profile reports
+            # numberOfFanSpeeds=3.  These units under-report their capability:
+            # real hardware accepts the full superQuiet..superPowerful range,
+            # as confirmed on units in the field.
+            valid_speeds = ["superQuiet", "quiet", "low", "powerful", "superPowerful"]
         elif speeds == 4:
             valid_speeds = ["quiet", "Low", "powerful", "superPowerful"]
         else:
