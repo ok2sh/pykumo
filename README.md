@@ -102,7 +102,7 @@ To restore the unit's own return-air sensor:
 unit.set_temp_source('returnair')
 ```
 
-Writes are applied asynchronously, so the response may have stale value if queried immediately. Re-send the temperature periodically (roughly every 20 seconds) to keep it fresh. activeThermistor will report what temp source is currently in effect. If an updated temp is not supplied in a while, the device will auto fallback to using the internal thermistor.
+Writes are applied asynchronously, so the response may have a stale value if queried immediately. Re-send the temperature periodically (roughly every 20 seconds) to keep it fresh. activeThermistor reports which temp source is currently in effect. If an updated temperature is not supplied for a while, the device automatically falls back to using the internal thermistor.
 
 
 Note that the temperature source setting persists across adapter reboots, so be sure to restore it when you're done.

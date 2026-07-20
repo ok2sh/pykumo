@@ -698,16 +698,17 @@ class PyKumo(PyKumoBase):
         self._last_status_update = time.monotonic() - 2 * CACHE_INTERVAL_SECONDS
         return response
 
-    def set_injected_room_temp(self, temperature):
+def set_injected_room_temp(self, temperature):
         """Inject a room temperature for the unit to use.
-        only used if tempSource is set to 'api'.
-        The caller must re-send the value periodically to prevent the
-        system from ignoring it as stale.
+
+        Only used if tempSource is set to "api". The caller must re-send the value
+        periodically to prevent the system from ignoring it as stale.
         """
-        if self.get_temp_source() != "api":
+        temp_source = self.get_temp_source()
+        if temp_source != "api":
             _LOGGER.warning(
                 "Ignoring injected room temp; tempSource is %s, not 'api'",
-                self.get_temp_source(),
+                temp_source,
             )
             return {}
         temperature = round(float(temperature), 1)

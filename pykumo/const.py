@@ -18,11 +18,7 @@ KUMO_RESPONSE_TIMEOUT_SECONDS = 60
 POSSIBLE_SENSORS = 4
 
 # Valid tempSource values. "unset" is reported by the adapter but rejected on write.
-TEMP_SOURCES = [
-    "sensor0",
-    "sensor1",
-    "sensor2",
-    "sensor3",
+TEMP_SOURCES = [f"sensor{i}" for i in range(POSSIBLE_SENSORS)] + [
     "returnair",
     "remote",
     "api",
