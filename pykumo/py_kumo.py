@@ -8,10 +8,38 @@ from collections.abc import MutableMapping
 from .schedule import UnitSchedule
 
 from .const import CACHE_INTERVAL_SECONDS, POSSIBLE_SENSORS, SETTABLE_TEMP_SOURCES
+from .cn105 import (
+    INFO_CODE_ROOM_TEMP,
+    INFO_CODE_STANDBY,
+    INFO_CODE_STATUS,
+    INFO_RESPONSE_TYPE,
+    MAX_FRAME_LEN,
+    build_info_request,
+    decode_auto_sub_mode,
+    decode_compressor_frequency,
+    decode_compressor_runtime_hours,
+    decode_compressor_runtime_minutes,
+    decode_operating,
+    decode_outdoor_temperature,
+    decode_room_temperature,
+    decode_stage,
+    decode_status_0x03,
+    decode_status_0x06,
+    decode_status_0x09,
+    decode_sub_mode,
+    valid_cn105_reply,
+)
 from .py_kumo_base import PyKumoBase
 
 _LOGGER = logging.getLogger(__name__)
 ALL_FAN_SPEEDS = ["superQuiet", "quiet", "low", "Low", "powerful", "superPowerful"]
+# Poll timing for reading back a raw CN105 reply after transmitting a frame.
+# The adapter's readback buffer is volatile, so poll it repeatedly. Different
+# info codes answer at very different speeds off the same unit (0x03 ~2.7s,
+# 0x09 ~11s), and some codes (e.g. 0x06 on units that do not implement it) never
+# answer, so the default window is generous and a single miss just yields None.
+RAW_REPLY_POLL_INTERVAL_SECONDS = 0.5
+RAW_REPLY_TIMEOUT_SECONDS = 20.0
 
 
 def merge(d, v):
@@ -731,6 +759,310 @@ class PyKumo(PyKumoBase):
         response = self._request(command)
         self._last_status_update = time.monotonic() - 2 * CACHE_INTERVAL_SECONDS
         return response
+
+    def send_raw_cn105_frame(self, frame: bytes, id_byte: int = 1) -> bool:
+        """Transmit a complete raw CN105 frame onto the indoor unit's bus.
+
+        ``frame`` is the full wire frame (``FC | type | 01 30 | len | payload |
+        checksum``). This performs the single compound PUT of
+        ``indoorUnit.settings.rawITPFrame`` with ``frame``/``len``/``id`` set
+        together; Returns True on success. The frame length must be btwn 1-127.
+        """
+        frame = bytes(frame)
+        length = len(frame)
+        if not 1 <= length <= MAX_FRAME_LEN:
+            _LOGGER.warning(
+                "%s: raw CN105 frame length %d out of range 1..%d",
+                self._name,
+                length,
+                MAX_FRAME_LEN,
+            )
+            return False
+        command = (
+            '{"c":{"indoorUnit":{"settings":{"rawITPFrame":'
+            '{"frame":"%s","len":%d,"id":%d}}}}}'
+            % (frame.hex(), length, id_byte)
+        ).encode("utf-8")
+        response = self._request(command)
+        if not response or "_api_error" in response:
+            _LOGGER.warning(
+                "%s: failed to send raw CN105 frame: %s", self._name, response
+            )
+            return False
+        return True
+
+    def read_raw_cn105_frame(self) -> bytes | None:
+        """Read back the last raw CN105 reply latched by the adapter.
+
+        Returns the reply frame bytes, or None if the buffer is empty or the
+        response is malformed.
+        """
+        query = '{"c":{"indoorUnit":{"settings":{"rawITPFrame":{}}}}}'.encode("utf-8")
+        response = self._request(query)
+        try:
+            node = response["r"]["indoorUnit"]["settings"]["rawITPFrame"]
+        except (KeyError, TypeError):
+            return None
+        hexstr = node.get("frame") if isinstance(node, dict) else None
+        if not hexstr:
+            return None
+        try:
+            return bytes.fromhex(hexstr)
+        except ValueError:
+            _LOGGER.warning(
+                "%s: raw CN105 readback is not valid hex: %r", self._name, hexstr
+            )
+            return None
+
+    def transceive_cn105_frame(
+        self,
+        frame: bytes,
+        id_byte: int = 1,
+        expect_type: int | None = None,
+        expect_code: int | None = None,
+        timeout: float = RAW_REPLY_TIMEOUT_SECONDS,
+    ) -> bytes | None:
+        """Send a raw CN105 frame once and return the unit's reply frame.
+
+        Transmits ``frame`` a single time, then polls the readback
+        buffer for up to ``timeout`` seconds. If ``expect_type``/``expect_code``
+        are given, only a reply whose byte[1] == expect_type and byte[5] ==
+        expect_code is accepted, so a stale reply for another info code sharing
+        the single readback buffer is skipped and polling continues. The reply
+        checksum is validated. Returns the reply frame bytes, or None if no
+        matching reply arrives within ``timeout``.
+        """
+        if not self.send_raw_cn105_frame(frame, id_byte):
+            return None
+        poll_count = max(1, int(timeout / RAW_REPLY_POLL_INTERVAL_SECONDS))
+        for _ in range(poll_count):
+            time.sleep(RAW_REPLY_POLL_INTERVAL_SECONDS)
+            reply = self.read_raw_cn105_frame()
+            if not valid_cn105_reply(reply):
+                continue
+            if expect_type is not None and reply[1] != expect_type:
+                continue
+            if expect_code is not None and reply[5] != expect_code:
+                continue
+            return reply
+        _LOGGER.debug(
+            "%s: no valid CN105 reply within %.1fs", self._name, timeout
+        )
+        return None
+
+    def get_outdoor_temperature(self) -> float | None:
+        """Read outdoor air temperature (C) straight off the CN105 bus.
+
+        Sends a ``0x03`` info request and decodes the outdoor temperature from
+        the ``0x62`` reply for the outdoor unit. Returns None if not avavilable
+        for whatever reason.
+        """
+        frame = build_info_request(INFO_CODE_ROOM_TEMP)
+        reply = self.transceive_cn105_frame(
+            frame, expect_type=INFO_RESPONSE_TYPE, expect_code=INFO_CODE_ROOM_TEMP
+        )
+        if reply is None:
+            return None
+        return decode_outdoor_temperature(reply)
+
+    def get_raw_room_temperature(self) -> float | None:
+        """Read room temperature (C) straight off the CN105 bus.
+
+        Companion to :meth:`get_outdoor_temperature`; decodes the room
+        temperature from the same ``0x03`` reply. Returns None on no reply.
+        """
+        frame = build_info_request(INFO_CODE_ROOM_TEMP)
+        reply = self.transceive_cn105_frame(
+            frame, expect_type=INFO_RESPONSE_TYPE, expect_code=INFO_CODE_ROOM_TEMP
+        )
+        if reply is None:
+            return None
+        return decode_room_temperature(reply)
+
+    def get_operating(self) -> bool | None:
+        """Read the operating flag straight off the CN105 bus.
+
+        Sends a ``0x06`` info request and decodes the operating byte from the
+        ``0x62`` reply: True = compressor running, False = standby. Returns None
+        on an invalid frame, or if the unit does not support the ``0x06`` status
+        frame, which just results in this timing out and may require an adapter
+        reboot(?) to unblock other cn105 commands.
+        """
+        reply = self.transceive_cn105_frame(
+            build_info_request(INFO_CODE_STATUS),
+            expect_type=INFO_RESPONSE_TYPE,
+            expect_code=INFO_CODE_STATUS,
+        )
+        if reply is None:
+            return None
+        return decode_operating(reply)
+
+    def get_compressor_frequency(self) -> int | None:
+        """Read the compressor frequency (Hz).
+        """
+        reply = self.transceive_cn105_frame(
+            build_info_request(INFO_CODE_STATUS),
+            expect_type=INFO_RESPONSE_TYPE,
+            expect_code=INFO_CODE_STATUS,
+        )
+        if reply is None:
+            return None
+        return decode_compressor_frequency(reply)
+
+    def _read_standby_reply(self) -> bytes | None:
+        """Reads ``0x09`` standby reply frame"""
+        return self.transceive_cn105_frame(
+            build_info_request(INFO_CODE_STANDBY),
+            expect_type=INFO_RESPONSE_TYPE,
+            expect_code=INFO_CODE_STANDBY,
+        )
+
+    def get_sub_mode(self) -> str | None:
+        """Read the sub mode.
+
+        """
+        reply = self._read_standby_reply()
+        if reply is None:
+            return None
+        return decode_sub_mode(reply)
+
+    def get_stage(self) -> str | None:
+        """Read the indoor fan stage.
+
+        """
+        reply = self._read_standby_reply()
+        if reply is None:
+            return None
+        return decode_stage(reply)
+
+    def get_auto_sub_mode(self) -> str | None:
+        """Read the auto sub mode.
+        """
+        reply = self._read_standby_reply()
+        if reply is None:
+            return None
+        return decode_auto_sub_mode(reply)
+
+    def get_compressor_runtime_minutes(self) -> int | None:
+        """Read the compressor runtime counter (minutes).
+        The counter advances only while the compressor is actually running.
+        """
+        reply = self.transceive_cn105_frame(
+            build_info_request(INFO_CODE_ROOM_TEMP),
+            expect_type=INFO_RESPONSE_TYPE,
+            expect_code=INFO_CODE_ROOM_TEMP,
+        )
+        if reply is None:
+            return None
+        return decode_compressor_runtime_minutes(reply)
+
+    def get_compressor_runtime_hours(self) -> float | None:
+        """Read the compressor runtime counter (hours).
+
+        Companion to :meth:`get_compressor_runtime_minutes` that returns the
+        counter in hours. Returns None on no reply or an invalid frame.
+        """
+        reply = self.transceive_cn105_frame(
+            build_info_request(INFO_CODE_ROOM_TEMP),
+            expect_type=INFO_RESPONSE_TYPE,
+            expect_code=INFO_CODE_ROOM_TEMP,
+        )
+        if reply is None:
+            return None
+        return decode_compressor_runtime_hours(reply)
+
+    def get_status_0x03(self) -> dict | None:
+        """Reads room/outdoor/runtime.
+        """
+        reply = self.transceive_cn105_frame(
+            build_info_request(INFO_CODE_ROOM_TEMP),
+            expect_type=INFO_RESPONSE_TYPE,
+            expect_code=INFO_CODE_ROOM_TEMP,
+        )
+        if reply is None:
+            return None
+        return decode_status_0x03(reply)
+
+    def get_status_0x09(self) -> dict | None:
+        """Reads standby status.
+
+        """
+        reply = self._read_standby_reply()
+        if reply is None:
+            return None
+        return decode_status_0x09(reply)
+
+    def get_status_0x06(self, timeout: float = RAW_REPLY_TIMEOUT_SECONDS) -> dict | None:
+        """Read the full ``0x06`` status in one round trip.
+
+        Only on supported units. For unsupported units, this is just going to time out
+        and worse may block other cn105 commands until the adapter is rebooted.
+        """
+        reply = self.transceive_cn105_frame(
+            build_info_request(INFO_CODE_STATUS),
+            expect_type=INFO_RESPONSE_TYPE,
+            expect_code=INFO_CODE_STATUS,
+            timeout=timeout,
+        )
+        if reply is None:
+            return None
+        return decode_status_0x06(reply)
+
+    def get_conditioning_activity(self, sample_interval: float = 75.0) -> dict:
+        """Estimate whether the unit is actually heating/cooling right now.
+        
+        This refreshes quite slowly compared to 0x06's operating field, so that's
+        definitely preferred. But this can be a good fallback when 0x06 is not supported.
+
+        Reads the compressor runtime counter twice, ``sample_interval`` seconds
+        apart, and reports the unit as active when the counter advanced. Returns
+        ``{"active", "activity", "mode", "delta_minutes", "sample_interval"}``.
+
+        When :meth:`get_mode` is ``'off'`` this returns immediately without
+        sampling. Otherwise ``active`` is True when the runtime delta is > 0, and
+        ``activity`` is one of ``"cooling"``, ``"heating"``, ``"conditioning"``
+        (mode ``'auto'`` or other, direction ambiguous from runtime alone),
+        ``"idle"`` (on but no compressor demand), ``"off"``, or ``"unknown"``
+        (a runtime read failed).
+
+        """
+        mode = self.get_mode()
+        if mode == "off":
+            return {
+                "active": False,
+                "activity": "off",
+                "mode": "off",
+                "delta_minutes": 0,
+                "sample_interval": 0,
+            }
+        m0 = self.get_compressor_runtime_minutes()
+        time.sleep(sample_interval)
+        m1 = self.get_compressor_runtime_minutes()
+        if m0 is None or m1 is None:
+            return {
+                "active": None,
+                "activity": "unknown",
+                "mode": mode,
+                "delta_minutes": None,
+                "sample_interval": sample_interval,
+            }
+        delta = m1 - m0
+        active = delta > 0
+        if not active:
+            activity = "idle"
+        elif mode == "cool":
+            activity = "cooling"
+        elif mode == "heat":
+            activity = "heating"
+        else:
+            activity = "conditioning"
+        return {
+            "active": active,
+            "activity": activity,
+            "mode": mode,
+            "delta_minutes": delta,
+            "sample_interval": sample_interval,
+        }
 
     def do_reboot(self):
         """Issue a reboot command to the indoor unit's adapter."""
